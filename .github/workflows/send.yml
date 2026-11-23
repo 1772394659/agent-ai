@@ -1,0 +1,132 @@
+name: Send Douyin Messages
+
+# 说明：
+# 1) schedule 已启用：每天北京时间 00:00（GitHub 2026-03 起支持 timezone 字段）
+#    本机 Windows 任务已改为 00:30：云端 00:00 先发、本机 00:30 后发，
+#    错开 30 分钟避免同源 Cookie 的两个 Playwright 会话同时在线。
+#    注意 00:00 是 GitHub 整点高峰，可能延迟；若明显延迟可微调 "7 0 * * *"。
+# 2) workflow_dispatch 默认 dry_run=true，避免手动点一下就真实发出去
+# 3) 相比上游官方版，仅新增 TZ / DOUYIN_STORAGE_STATE 两行 env 与一个时间自检步骤
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Only verify login and friends without sending
+        type: boolean
+        default: true
+  schedule:
+    # 北京时间 00:00 云端先发；本机 Windows 任务 00:30 后发（对调，仍错峰 30 分钟）
+    - cron: "0 0 * * *"
+      timezone: "Asia/Shanghai"
+
+concurrency:
+  group: douyin-daily-sender
+  cancel-in-progress: false
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      TZ: "Asia/Shanghai"
+      DOUYIN_STORAGE_STATE: ${{ secrets.DOUYIN_STORAGE_STATE }}
+      DOUYIN_COOKIE: ${{ secrets.DOUYIN_COOKIE }}
+      DOUYIN_CONFIG: ${{ secrets.DOUYIN_CONFIG }}
+      DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
+      DINGTALK_SECRET: ${{ secrets.DINGTALK_SECRET }}
+      WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+      WEBHOOK_HEADERS: ${{ secrets.WEBHOOK_HEADERS }}
+      WEBHOOK_TEMPLATE: ${{ secrets.WEBHOOK_TEMPLATE }}
+      HEADLESS: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - run: python -m playwright install --with-deps chromium
+      - name: Show effective local time
+        shell: bash
+        run: date '+runner-local-time=%Y-%m-%d %H:%M:%S %Z (%z)'
+      - name: Write protected configuration
+        shell: bash
+        run: printf '%s' "$DOUYIN_CONFIG" > config.json
+      - name: Write multi-account configuration
+        shell: bash
+        env:
+          COOKIE_1: ${{ secrets.DOUYIN_COOKIE_ACCOUNT1 }}
+          CONFIG_1: ${{ secrets.DOUYIN_CONFIG_ACCOUNT1 }}
+          COOKIE_2: ${{ secrets.DOUYIN_COOKIE_ACCOUNT2 }}
+          CONFIG_2: ${{ secrets.DOUYIN_CONFIG_ACCOUNT2 }}
+          COOKIE_3: ${{ secrets.DOUYIN_COOKIE_ACCOUNT3 }}
+          CONFIG_3: ${{ secrets.DOUYIN_CONFIG_ACCOUNT3 }}
+          COOKIE_4: ${{ secrets.DOUYIN_COOKIE_ACCOUNT4 }}
+          CONFIG_4: ${{ secrets.DOUYIN_CONFIG_ACCOUNT4 }}
+          COOKIE_5: ${{ secrets.DOUYIN_COOKIE_ACCOUNT5 }}
+          CONFIG_5: ${{ secrets.DOUYIN_CONFIG_ACCOUNT5 }}
+          LEGACY_COOKIE: ${{ secrets.DOUYIN_COOKIE }}
+          LEGACY_CONFIG: ${{ secrets.DOUYIN_CONFIG }}
+        run: |
+          mkdir -p config/tasks
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          if not any(os.environ.get(f"COOKIE_{i}") for i in range(1, 6)):
+              print("未配置多账号 Secret，继续使用旧单账号模式")
+              raise SystemExit(0)
+
+          accounts = []
+          for index in range(1, 6):
+              if index == 1 and not os.environ.get("COOKIE_1") and not os.environ.get("CONFIG_1"):
+                  cookie = os.environ.get("LEGACY_COOKIE")
+                  config = os.environ.get("LEGACY_CONFIG")
+              else:
+                  cookie = os.environ.get(f"COOKIE_{index}")
+                  config = os.environ.get(f"CONFIG_{index}")
+              if not cookie and not config:
+                  continue
+              if not cookie or not config:
+                  raise SystemExit(
+                      f"账号 account{index} 的 DOUYIN_COOKIE_ACCOUNT{index} 与 "
+                      f"DOUYIN_CONFIG_ACCOUNT{index} 必须同时配置"
+                  )
+              try:
+                  json.loads(cookie)
+              except json.JSONDecodeError as exc:
+                  raise SystemExit(f"DOUYIN_COOKIE_ACCOUNT{index} 不是有效 JSON: {exc}") from exc
+              try:
+                  json.loads(config)
+              except json.JSONDecodeError as exc:
+                  raise SystemExit(f"DOUYIN_CONFIG_ACCOUNT{index} 不是有效 JSON: {exc}") from exc
+              env_file = f".env.account{index}"
+              Path(env_file).write_text(
+                  f"DOUYIN_COOKIE={json.dumps(cookie)}\nTASK_CONFIG=config/tasks/account{index}.json\n",
+                  encoding="utf-8",
+              )
+              Path(f"config/tasks/account{index}.json").write_text(config, encoding="utf-8")
+              accounts.append({"id": f"account{index}", "enabled": True, "env_file": env_file})
+          Path("config/accounts.json").write_text(
+              json.dumps({"accounts": accounts}, ensure_ascii=False, indent=2),
+              encoding="utf-8",
+          )
+          PY
+      - name: Run
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.dry_run }}" == "true" ]]; then
+            python run.py --dry-run
+          else
+            python run.py
+          fi
+      - name: Upload diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: douyin-failure-${{ github.run_id }}
+          path: artifacts/
+          retention-days: 3
